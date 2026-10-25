@@ -9,9 +9,12 @@ Five-stage defense-in-depth pipeline for generated code proposals:
 4. Disposable sandbox dry-run execution.
 5. Exact minimal unified diff generation, human approval gating, and verifiable PatchReceipt.
 
-Invariant:
+Invariants:
 `ast.parse()` only establishes grammatical validity; it does not establish safety.
 Unsandboxed or unreviewed model output MUST NEVER be written directly to workspace files.
+A patch is written only under an ExecutionGrant from the CapabilityGovernor: the write
+is a WORKSPACE_WRITE ActionProposal whose target is path-confined to the workspace and
+whose arguments bind the exact proposed content and diff digests.
 """
 
 from __future__ import annotations
@@ -28,6 +31,15 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+from osiris.agents.gateway import (
+    ActionProposal,
+    AuthorizedAgentRequest,
+    CapabilityGovernor,
+    GovernanceViolation,
+    HumanApproval,
+    build_proposal,
+)
 
 
 # Forbidden builtins that bypass runtime boundaries
@@ -117,6 +129,9 @@ class PatchReceipt:
     approval_token: Optional[str]
     applied: bool
     receipt_hash: str
+    grant_id: Optional[str] = None
+    proposal_digest: Optional[str] = None
+    governance_error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -340,8 +355,56 @@ def generate_patch_diff(
 class SafePatchWorkflow:
     """Coordinates the 5-stage proposal-to-patch pipeline and creates signed receipts."""
 
-    def __init__(self, workspace_root: Optional[Union[str, Path]] = None):
+    PROPOSER_ID = "osiris_cli.safe_patch"
+    #: A human reads the diff between /propose and /apply, so patch proposals live
+    #: longer than inline tool-call proposals. Expired proposals are refused.
+    PROPOSAL_TTL_S = 900.0
+
+    def __init__(
+        self,
+        workspace_root: Optional[Union[str, Path]] = None,
+        governor: Optional[CapabilityGovernor] = None,
+    ):
         self.workspace_root = Path(workspace_root or ".").resolve()
+        self.governor = governor or CapabilityGovernor(self.workspace_root)
+
+    def patch_request(self, request_id: Optional[str] = None) -> AuthorizedAgentRequest:
+        """Request scope for a single patch write: WORKSPACE_WRITE and nothing else."""
+        rid = request_id or f"patch-{hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:12]}"
+        return AuthorizedAgentRequest(
+            request_id=rid,
+            task="safe_patch.apply",
+            allowed_capabilities=frozenset({"WORKSPACE_WRITE"}),
+            data_classification="LOCAL_WORKSPACE",
+            authority_scope=f"workspace:{self.workspace_root}",
+        )
+
+    def build_patch_proposal(
+        self,
+        target_relative_path: str,
+        code: str,
+        diff_text: str,
+        original_sha256: Optional[str],
+        request: AuthorizedAgentRequest,
+    ) -> ActionProposal:
+        """WORKSPACE_WRITE proposal binding the exact content and diff a human reviews."""
+        prop_sha256 = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        diff_sha256 = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
+        return build_proposal(
+            request=request,
+            capability="WORKSPACE_WRITE",
+            locator=target_relative_path,
+            arguments={
+                "target_file": target_relative_path,
+                "original_sha256": original_sha256,
+                "proposed_sha256": prop_sha256,
+                "diff_sha256": diff_sha256,
+            },
+            proposer_id=self.PROPOSER_ID,
+            provider="safe_patch",
+            content_digest=f"sha256:{prop_sha256}",
+            ttl_s=self.PROPOSAL_TTL_S,
+        )
 
     def process_proposal(
         self,
@@ -436,20 +499,55 @@ class SafePatchWorkflow:
         ast_safe: bool,
         sandbox_passed: bool,
         human_approved: bool,
-        approval_token: Optional[str] = None
+        approval_token: Optional[str] = None,
+        *,
+        proposal: Optional[ActionProposal] = None,
+        approval: Optional[HumanApproval] = None,
+        request: Optional[AuthorizedAgentRequest] = None,
     ) -> PatchReceipt:
-        """Applies patch to workspace target if approved, generating a cryptographic PatchReceipt."""
-        target_path = (self.workspace_root / target_relative_path).resolve()
+        """Applies the patch only under a verified ExecutionGrant, and always returns a receipt.
+
+        Callers that already showed the diff pass the ``proposal`` they showed and the
+        ``approval`` bound to it. The legacy ``human_approved`` flag still works: it is
+        converted into a HumanApproval bound to a freshly built proposal, so it gets
+        the same path confinement and digest binding as the interactive path.
+        """
         now_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
         prop_sha256 = hashlib.sha256(code.encode("utf-8")).hexdigest()
         diff_sha256 = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
 
+        if proposal is not None and request is None:
+            request = self.patch_request(proposal.request_id)
+        request = request or self.patch_request()
+        proposal = proposal or self.build_patch_proposal(
+            target_relative_path, code, diff_text, original_sha256, request
+        )
+        if approval is None and human_approved:
+            approval = HumanApproval.for_proposal(
+                proposal, approver_id=approval_token or "human", channel="api"
+            )
+
         applied = False
-        if human_approved and ast_safe and sandbox_passed:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_text(code, encoding="utf-8")
-            applied = True
+        grant_id: Optional[str] = None
+        governance_error: Optional[str] = None
+        if not (ast_safe and sandbox_passed):
+            governance_error = "pre-gate failed: patch is not AST-safe and sandbox-verified"
+        elif proposal.arguments.get("proposed_sha256") != prop_sha256 or \
+                proposal.arguments.get("diff_sha256") != diff_sha256 or \
+                proposal.target.locator != target_relative_path:
+            governance_error = "patch content, diff or target differs from the reviewed proposal"
+        else:
+            try:
+                grant = self.governor.evaluate(proposal, request, approval=approval)
+                self.governor.verify_grant(grant, proposal)
+                target_path = self.governor.confine_path(target_relative_path)
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.write_text(code, encoding="utf-8")
+                applied = True
+                grant_id = grant.grant_id
+            except GovernanceViolation as exc:
+                governance_error = str(exc)
 
         raw_receipt = {
             "receipt_id": f"PATCH-REC-{hashlib.sha256((now_str + target_relative_path).encode()).hexdigest()[:12]}",
@@ -460,24 +558,14 @@ class SafePatchWorkflow:
             "diff_sha256": diff_sha256,
             "ast_safe": ast_safe,
             "sandbox_passed": sandbox_passed,
-            "human_approved": human_approved,
+            "human_approved": approval is not None,
             "approval_token": approval_token,
-            "applied": applied
+            "applied": applied,
+            "grant_id": grant_id,
+            "proposal_digest": proposal.proposal_digest,
+            "governance_error": governance_error,
         }
         canonical_str = json.dumps(raw_receipt, sort_keys=True, separators=(",", ":"))
         receipt_hash = hashlib.sha256(canonical_str.encode("utf-8")).hexdigest()
 
-        return PatchReceipt(
-            receipt_id=raw_receipt["receipt_id"],
-            timestamp=raw_receipt["timestamp"],
-            target_file=raw_receipt["target_file"],
-            original_sha256=raw_receipt["original_sha256"],
-            proposed_sha256=raw_receipt["proposed_sha256"],
-            diff_sha256=raw_receipt["diff_sha256"],
-            ast_safe=raw_receipt["ast_safe"],
-            sandbox_passed=raw_receipt["sandbox_passed"],
-            human_approved=raw_receipt["human_approved"],
-            approval_token=raw_receipt["approval_token"],
-            applied=raw_receipt["applied"],
-            receipt_hash=receipt_hash
-        )
+        return PatchReceipt(receipt_hash=receipt_hash, **raw_receipt)

@@ -109,3 +109,64 @@ def test_claim_ceiling_never_projects_upward():
         else:
             # Projected down onto a weaker-or-equal rung that actually exists.
             assert int(projected) < int(ClaimCeiling[occr_names[-1]])
+
+
+# ── Interactive vs batch horizons ──────────────────────────────────────────────
+
+def test_interactive_horizon_defaults_to_120s(monkeypatch):
+    monkeypatch.delenv(substrate.INTERACTIVE_TIMEOUT_ENV, raising=False)
+    assert substrate.interactive_timeout_s() == 120.0
+
+
+def test_interactive_horizon_env_override(monkeypatch):
+    monkeypatch.setenv(substrate.INTERACTIVE_TIMEOUT_ENV, "45")
+    assert substrate.interactive_timeout_s() == 45.0
+    assert substrate.interactive_timeout_s(10.0) == 10.0  # explicit override wins
+
+
+@pytest.mark.parametrize("raw", ["abc", "0", "-5", "nan", "inf", ""])
+def test_malformed_interactive_override_falls_back_not_disables(monkeypatch, raw):
+    monkeypatch.setenv(substrate.INTERACTIVE_TIMEOUT_ENV, raw)
+    assert substrate.interactive_timeout_s() == 120.0
+
+
+def test_interactive_horizon_never_exceeds_batch_horizon(monkeypatch):
+    monkeypatch.setenv(substrate.INTERACTIVE_TIMEOUT_ENV, "999999")
+    assert substrate.interactive_timeout_s() == substrate.execution_timeout_s()
+
+
+def test_command_runner_uses_interactive_horizon(monkeypatch, tmp_path):
+    from osiris_cli.command_runner import CommandRunner
+
+    monkeypatch.setenv(substrate.INTERACTIVE_TIMEOUT_ENV, "33")
+    assert CommandRunner(tmp_path).timeout_seconds == 33.0
+    assert CommandRunner(tmp_path, timeout_seconds=7).timeout_seconds == 7
+
+
+# ── Telemetry frame shape ──────────────────────────────────────────────────────
+
+def test_telemetry_frame_carries_the_same_keys_on_every_node():
+    ctx = substrate.get_substrate_context()
+    assert set(substrate.TELEMETRY_KEYS) <= set(ctx)
+    assert ctx["horizon_s"] == substrate.execution_timeout_s()
+    assert ctx["node_id"] == substrate.node_id()
+    # Unmeasured NCLM metrics are present but never synthesized.
+    assert ctx["w2_distance"] is None and ctx["shannon_entropy"] is None
+
+
+def test_node_id_is_stable_and_does_not_publish_the_hostname():
+    import platform
+
+    assert substrate.node_id() == substrate.node_id()
+    assert platform.node() not in substrate.node_id() or not platform.node()
+
+
+def test_telemetry_frame_records_supplied_metrics():
+    ctx = substrate.get_substrate_context(w2_distance=0.125, shannon_entropy=2.0)
+    assert ctx["w2_distance"] == 0.125 and ctx["shannon_entropy"] == 2.0
+
+
+@pytest.mark.parametrize("kwargs", [{"w2_distance": -1.0}, {"shannon_entropy": float("nan")}])
+def test_telemetry_frame_rejects_invalid_metrics(kwargs):
+    with pytest.raises(ValueError):
+        substrate.get_substrate_context(**kwargs)

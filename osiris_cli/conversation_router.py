@@ -4,15 +4,32 @@ OSIRIS Conversation Router
 
 Routes classified user requests to slash commands, local code inspection,
 planning, research workbench, or conversational model generation.
+
+When the session model is a real model (anything outside ``TEMPLATE_MODELS``),
+free-text turns go through ``AgentGateway`` to ``LocalBrainAdapter``. Every tool
+call and every patch write is an ``ActionProposal`` the ``CapabilityGovernor``
+must grant; the active mode bounds which capabilities a request may carry.
 """
 
 from __future__ import annotations
 
-import json  # noqa: F401
-import os  # noqa: F401
+import asyncio
+import getpass
+import io
 import shlex
+import uuid
+from contextlib import redirect_stdout
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
+from typing import Any, Callable, Dict, List, Optional, Tuple  # noqa: F401
+
+from osiris.agents.gateway import (
+    ActionProposal,
+    AgentGateway,
+    AuthorizedAgentRequest,
+    CapabilityGovernor,
+    HumanApproval,
+    ModelRouter,
+)
 
 from osiris_cli.approval_ui import ApprovalUI
 from osiris_cli.command_runner import CommandRunner
@@ -27,6 +44,34 @@ from osiris_cli.process_doctor import ProcessDoctor
 from osiris_cli.safe_patch import SafePatchWorkflow
 from osiris_cli.session_manager import ConversationTurn, SessionManager, SessionState  # noqa: F401
 
+#: Model names served by the built-in templated responses rather than a real model.
+TEMPLATE_MODELS = frozenset({"local_nclm", "livlm", "swarm", "offline", ""})
+
+#: Capabilities every mode may request. Elevated ones are added per mode, and still
+#: need a per-action human approval from the CapabilityGovernor on top.
+_BASE_CAPABILITIES = frozenset({"READ_ONLY_ANALYSIS", "RETURN_STRUCTURED_PROPOSAL", "SESSION_STATE_WRITE"})
+_MODE_ELEVATIONS: Dict[str, frozenset] = {
+    "propose": frozenset({"WORKSPACE_WRITE"}),
+    "edit": frozenset({"WORKSPACE_WRITE", "SUBPROCESS_EXEC"}),
+    "test": frozenset({"SUBPROCESS_EXEC"}),
+}
+
+BackendFactory = Callable[["ConversationRouter"], Any]
+
+
+def mode_capabilities(mode: str) -> frozenset:
+    """Capability scope a request may carry in ``mode``. ``safe`` is strictly read-only."""
+    if mode == "safe":
+        return frozenset({"READ_ONLY_ANALYSIS", "RETURN_STRUCTURED_PROPOSAL"})
+    return _BASE_CAPABILITIES | _MODE_ELEVATIONS.get(mode, frozenset())
+
+
+def _operator_id() -> str:
+    try:
+        return getpass.getuser() or "operator"
+    except Exception:
+        return "operator"
+
 
 class ConversationRouter:
     """Dispatches user prompts to appropriate subsystems and formats responses."""
@@ -35,7 +80,8 @@ class ConversationRouter:
         self,
         workspace_root: str,
         session_manager: SessionManager,
-        renderer: Optional[OutputRenderer] = None
+        renderer: Optional[OutputRenderer] = None,
+        backend_factory: Optional[BackendFactory] = None,
     ):
         self.workspace_root = Path(workspace_root).resolve()
         self.session_manager = session_manager
@@ -43,12 +89,44 @@ class ConversationRouter:
         self.context_resolver = ContextResolver(str(self.workspace_root))
         self.command_runner = CommandRunner(str(self.workspace_root))
         self.process_doctor = ProcessDoctor(self.workspace_root)
-        self.safe_patch = SafePatchWorkflow(self.workspace_root)
+        self.governor = CapabilityGovernor(self.workspace_root)
+        self.safe_patch = SafePatchWorkflow(self.workspace_root, governor=self.governor)
         self.approval_ui = ApprovalUI(self.renderer)
         self.diff_viewer = DiffViewer(self.renderer)
         self.plan_renderer = PlanRenderer(self.renderer)
         self.policy_explainer = PolicyExplainer()
         self.help_system = HelpSystem(self.renderer)
+        self._backend_factory = backend_factory or _default_backend
+        self._backend: Any = None
+        self._pending_patch: Optional[Dict[str, Any]] = None
+
+    # ── Session-derived policy ───────────────────────────────────────────────
+    @property
+    def active_mode(self) -> str:
+        session = self.session_manager.current_session
+        return session.active_mode if session else "inspect"
+
+    @property
+    def active_model(self) -> str:
+        session = self.session_manager.current_session
+        return session.active_model if session else "local_nclm"
+
+    def generation_enabled(self) -> bool:
+        return self.active_model not in TEMPLATE_MODELS
+
+    def approve(self, proposal: ActionProposal, description: str) -> Optional[HumanApproval]:
+        """Interactive approver: a y/N prompt whose 'y' is bound to this proposal's digest."""
+        ok = self.approval_ui.prompt_confirmation(
+            f"Governed action [{proposal.capability}] {description}"
+        )
+        if not ok:
+            return None
+        return HumanApproval.for_proposal(proposal, approver_id=_operator_id(), channel="tty")
+
+    def backend(self) -> Any:
+        if self._backend is None:
+            self._backend = self._backend_factory(self)
+        return self._backend
 
     def route_turn(self, user_input: str) -> str:
         """Process a single turn of user input and return the assistant response."""
@@ -67,7 +145,11 @@ class ConversationRouter:
         for f_mention in mentions["files"]:
             self.context_resolver.add_file(f_mention)
 
-        # 3. Dispatch by Intent
+        # 3. Real model configured: every free-text turn is governed generation
+        if self.generation_enabled():
+            return self._handle_generation(text)
+
+        # 4. Dispatch by Intent (templated responses)
         if intent == UserIntent.EXPLAIN:
             return self._handle_explain(text)
         elif intent == UserIntent.DEBUG:
@@ -125,7 +207,16 @@ class ConversationRouter:
         elif cmd in ("/propose", "/patch"):
             raw_input = " ".join(args)
             if not raw_input:
-                return "Usage: /propose <code block or text>"
+                return "Usage: /propose <code block or text | file>"
+            if len(args) == 1:
+                # A single-line REPL cannot carry a fenced block, so accept a file
+                # (e.g. a saved model response), confined to the workspace.
+                try:
+                    candidate = self.governor.confine_path(args[0].lstrip("@"))
+                except Exception as exc:
+                    return self.renderer.red(f"❌ {exc}")
+                if candidate.is_file():
+                    raw_input = candidate.read_text(encoding="utf-8")
             res = self.safe_patch.process_proposal(raw_input)
             if not res["success"]:
                 stage = res.get("stage", "UNKNOWN")
@@ -145,7 +236,46 @@ class ConversationRouter:
                 self.renderer.bold("Unified Diff Preview:"),
                 self.diff_viewer.render_diff(diff_text) if diff_text else self.renderer.dim("Empty diff.")
             ]
+            target = res.get("target_file")
+            if target:
+                request = self.safe_patch.patch_request()
+                proposal = self.safe_patch.build_patch_proposal(
+                    target, res["code"], diff_text, res.get("original_sha256"), request
+                )
+                self._pending_patch = {"result": res, "proposal": proposal, "request": request}
+                lines += ["", self.renderer.dim(
+                    f"Pending WORKSPACE_WRITE proposal {proposal.proposal_id} → {target}. "
+                    f"Run /apply to request an ExecutionGrant."
+                )]
+            else:
+                self._pending_patch = None
+                lines += ["", self.renderer.dim(
+                    "No target file directive found; add '# TargetFile: <path>' to make it applicable."
+                )]
             return "\n".join(lines)
+
+        elif cmd == "/apply":
+            return self._handle_apply()
+
+        elif cmd == "/model":
+            if not args:
+                return f"Active model: {self.active_model}"
+            session = self.session_manager.current_session
+            if session:
+                session.active_model = args[0]
+                self.session_manager.save_session()
+            if self._backend is not None and hasattr(self._backend, "set_model"):
+                self._backend.set_model(args[0])
+            kind = "templated responses" if args[0] in TEMPLATE_MODELS else "governed local model"
+            return f"Model set to: {self.renderer.green(args[0])} ({kind})"
+
+        elif cmd == "/reset":
+            if self._backend is not None and hasattr(self._backend, "reset"):
+                self._backend.reset()
+            return "Model conversation context cleared (memory and sprint board retained)."
+
+        elif cmd in ("/memory", "/sprint", "/scan", "/ingest", "/audit"):
+            return self._handle_brain_command(cmd, args)
 
         elif cmd in ("/demo", "/slice"):
             from osiris_evidence_runtime_demo import run_full_demo
@@ -165,6 +295,10 @@ class ConversationRouter:
             self.workspace_root = new_path
             self.context_resolver = ContextResolver(str(self.workspace_root))
             self.command_runner = CommandRunner(str(self.workspace_root))
+            self.governor = CapabilityGovernor(self.workspace_root)
+            self.safe_patch = SafePatchWorkflow(self.workspace_root, governor=self.governor)
+            self._backend = None
+            self._pending_patch = None
             if self.session_manager.current_session:
                 self.session_manager.current_session.workspace_path = str(self.workspace_root)
                 self.session_manager.save_session()
@@ -225,6 +359,96 @@ class ConversationRouter:
             return "\033[2J\033[H"
 
         return f"Unknown command '{cmd}'. Type /help for available commands."
+
+    def _handle_generation(self, text: str) -> str:
+        backend = self.backend()
+        request = AuthorizedAgentRequest(
+            request_id=f"cli-{uuid.uuid4().hex[:12]}",
+            task=text,
+            allowed_capabilities=mode_capabilities(self.active_mode),
+            data_classification="LOCAL_WORKSPACE",
+            authority_scope=f"workspace:{self.workspace_root}",
+            session_id=(self.session_manager.current_session.session_id
+                        if self.session_manager.current_session else None),
+        )
+        gateway = AgentGateway(ModelRouter({"local_brain": backend}), self.governor)
+        response = asyncio.run(gateway.process(request))
+        result = response.result
+
+        if result.status == "ERROR":
+            return self.renderer.red(f"[model error] {result.error}")
+        lines = [result.output or self.renderer.dim("(no response)")]
+        if result.status != "SUCCESS":
+            lines.append(self.renderer.yellow(f"[{result.status}] {result.error or ''}".rstrip()))
+        ledger = result.usage.get("governance", []) if result.usage else []
+        if ledger:
+            granted = sum(1 for d in ledger if d["decision"] == "GRANTED")
+            denied = [d for d in ledger if d["decision"] != "GRANTED"]
+            lines.append(self.renderer.dim(
+                f"⚖ governance: {granted} granted · {len(denied)} denied · mode {self.active_mode}"
+            ))
+            for d in denied:
+                lines.append(self.renderer.dim(f"  ✗ {d['capability']} {d['locator']} — {d['reason']}"))
+        return "\n".join(lines)
+
+    def _handle_apply(self) -> str:
+        pending = self._pending_patch
+        if not pending:
+            return "No pending patch. Run /propose with a '# TargetFile:' directive first."
+        if "WORKSPACE_WRITE" not in mode_capabilities(self.active_mode):
+            return (f"/apply is not permitted in mode '{self.active_mode}'. "
+                    f"Switch with `/mode propose` or `/mode edit`.")
+
+        res, proposal, request = pending["result"], pending["proposal"], pending["request"]
+        self._pending_patch = None  # one attempt per proposal: its nonce is single-use
+        target = res["target_file"]
+        ok = self.approval_ui.prompt_confirmation(
+            f"Apply patch to {target} (proposal {proposal.proposal_id})?",
+            diff_callback=lambda: print(self.diff_viewer.render_diff(res["diff"])),
+        )
+        approval = (HumanApproval.for_proposal(proposal, approver_id=_operator_id(), channel="tty")
+                    if ok else None)
+        sandbox = res.get("sandbox_result")
+        receipt = self.safe_patch.apply_patch(
+            target_relative_path=target,
+            code=res["code"],
+            diff_text=res["diff"],
+            original_sha256=res.get("original_sha256"),
+            ast_safe=res["ast_result"].is_safe,
+            sandbox_passed=sandbox is not None and sandbox.exit_code == 0,
+            human_approved=False,
+            proposal=proposal,
+            approval=approval,
+            request=request,
+        )
+        if receipt.applied:
+            return self.renderer.green(
+                f"✓ Applied {target} under {receipt.grant_id} (receipt {receipt.receipt_id})"
+            )
+        return self.renderer.red(
+            f"✗ Patch not applied: {receipt.governance_error} (receipt {receipt.receipt_id})"
+        )
+
+    def _handle_brain_command(self, cmd: str, args: List[str]) -> str:
+        import osiris_brain as brain
+
+        if cmd == "/memory":
+            return brain.tool_recall("all")
+        if cmd == "/sprint":
+            return brain.tool_sprint_task("list")
+        if not args:
+            return f"Usage: {cmd} <path>"
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            if cmd == "/scan":
+                brain.write_index(args[0])
+            elif cmd == "/ingest":
+                print(brain.ingest_text(args[0]))
+            else:
+                print(brain.audit_repo(args[0]))
+        if cmd in ("/scan", "/ingest") and self._backend is not None:
+            self._backend.refresh_system_prompt()
+        return buf.getvalue().rstrip()
 
     def _handle_explain(self, text: str) -> str:
         ctx_files = self.context_resolver.list_files()
@@ -314,3 +538,14 @@ class ConversationRouter:
             "I can inspect code, plan refactors, preregister experiments, and explain governance policies.\n"
             "Type `/help` to see all available commands, or mention a file with `@path/to/file` to inspect it."
         )
+
+
+def _default_backend(router: "ConversationRouter") -> Any:
+    from osiris.agents.gateway.adapters import LocalBrainAdapter
+
+    return LocalBrainAdapter(
+        router.workspace_root,
+        model=router.active_model,
+        approver=router.approve,
+        governor=router.governor,
+    )

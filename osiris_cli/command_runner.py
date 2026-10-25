@@ -15,6 +15,7 @@ import time  # noqa: F401
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union  # noqa: F401
 
+from osiris.substrate import interactive_timeout_s
 from osiris_cli.process_doctor import ProcessDiagnosticReceipt, ProcessDoctor
 
 
@@ -26,9 +27,17 @@ class CommandRunner:
         "mkdir", "cp", "echo", "pwd", "tree", "node", "which", "head", "tail"
     ]
 
-    def __init__(self, workspace_root: Union[str, Path], timeout_seconds: int = 120):
+    def __init__(
+        self,
+        workspace_root: Union[str, Path],
+        timeout_seconds: Optional[float] = None,
+    ):
         self.workspace_root = Path(workspace_root).resolve()
-        self.timeout_seconds = timeout_seconds
+        # Interactive horizon, not the batch horizon: a stuck child must not hold
+        # the REPL for 1800 s on Node Beta.
+        self.timeout_seconds = (
+            interactive_timeout_s() if timeout_seconds is None else timeout_seconds
+        )
         self.doctor = ProcessDoctor(self.workspace_root)
         self.last_receipt: Optional[ProcessDiagnosticReceipt] = None
 

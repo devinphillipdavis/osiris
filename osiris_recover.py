@@ -13,6 +13,8 @@ Usage:
 Requires: gh CLI authenticated  OR  GITHUB_TOKEN env var
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import json

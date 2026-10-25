@@ -268,7 +268,7 @@ class ProcessDoctor:
                 while chunk := f.read(65536):
                     sha256_hash.update(chunk)
             file_digest = sha256_hash.hexdigest()
-        except Exception:
+        except Exception as _e:
             file_digest = None
 
         # If shebang exists, verify interpreter presence

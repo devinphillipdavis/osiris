@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field  # noqa: F401
-from datetime import datetime, timezone  # noqa: F401
+from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import json
@@ -33,10 +33,13 @@ def compute_sha256(payload: Any) -> str:
 
 
 class ActionKind(str, Enum):
-    """Permitted canonical action kinds for offline vertical slice."""
+    """Canonical action kinds. Each value is also the capability that authorizes it."""
     READ_ONLY_ANALYSIS = "READ_ONLY_ANALYSIS"
     RETURN_STRUCTURED_PROPOSAL = "RETURN_STRUCTURED_PROPOSAL"
     REPLAY_FIXTURE = "REPLAY_FIXTURE"
+    SESSION_STATE_WRITE = "SESSION_STATE_WRITE"   # agent-private state dir only
+    WORKSPACE_WRITE = "WORKSPACE_WRITE"           # requires a bound HumanApproval
+    SUBPROCESS_EXEC = "SUBPROCESS_EXEC"           # requires a bound HumanApproval
 
 
 class RiskTier(int, Enum):
@@ -44,8 +47,8 @@ class RiskTier(int, Enum):
     TIER_0_NO_RISK = 0        # In-memory, read-only analysis
     TIER_1_LOW_RISK = 1        # Replay fixture verification
     TIER_2_CONTROLLED = 2      # Sandboxed temporary read
-    TIER_3_ELEVATED = 3        # State modification (requires human grant)
-    TIER_4_HIGH = 4            # Subprocess/network (prohibited in slice 1)
+    TIER_3_ELEVATED = 3        # Workspace modification (requires human grant)
+    TIER_4_HIGH = 4            # Subprocess (requires human grant); network prohibited
     TIER_5_CRITICAL = 5        # Key/secret/sovereign authority (prohibited)
 
 
@@ -118,6 +121,40 @@ class ActionProposal:
 
 
 @dataclass(frozen=True)
+class HumanApproval:
+    """A human decision bound to exactly one proposal digest.
+
+    Binding to the digest means an approval cannot be replayed onto a different
+    target, different arguments, or a re-issued proposal with a fresh nonce.
+    """
+    approval_id: str
+    proposal_digest: str
+    approver_id: str
+    channel: str
+    approved_at: datetime
+
+    @classmethod
+    def for_proposal(
+        cls,
+        proposal: "ActionProposal",
+        approver_id: str,
+        channel: str = "tty",
+        now: datetime | None = None,
+    ) -> "HumanApproval":
+        approved_at = now or datetime.now(timezone.utc)
+        approval_id = "approval_" + compute_sha256(
+            f"{proposal.proposal_digest}:{approver_id}:{approved_at.isoformat()}"
+        )[7:23]
+        return cls(
+            approval_id=approval_id,
+            proposal_digest=proposal.proposal_digest,
+            approver_id=approver_id,
+            channel=channel,
+            approved_at=approved_at,
+        )
+
+
+@dataclass(frozen=True)
 class AuthorizedAgentRequest:
     """Policy-bound request dispatched to an agent adapter."""
     request_id: str
@@ -140,6 +177,7 @@ class AgentResult:
     proposals: tuple[ActionProposal, ...]
     usage: Mapping[str, Any]
     error: str | None = None
+    output: str | None = None
 
 
 @dataclass(frozen=True)

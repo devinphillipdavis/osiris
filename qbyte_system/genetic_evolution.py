@@ -243,7 +243,7 @@ class GeneticEvolutionEngine:
                 if self.config.enable_healing and gamma > self.config.healing_threshold:
                     individual = self._apply_healing(individual)
 
-            except Exception:
+            except Exception as _e:
                 individual.fitness = 0.0
 
         # Update best ever

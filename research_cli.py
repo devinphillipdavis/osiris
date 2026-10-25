@@ -195,10 +195,11 @@ def cmd_experiment_simulate(args: argparse.Namespace) -> int:
     prereg = orchestrator.preregister(data)
 
     # Use specified script or inline mock runner script for safe local simulation
-    script_to_run = args.script or "/home/enki/scratch/mock_sim_runner.py"
+    scratch_root = Path(os.environ.get("OSIRIS_SCRATCH") or Path.home() / "scratch")
+    script_to_run = args.script or str(scratch_root / "mock_sim_runner.py")
     if not Path(script_to_run).exists():
         # Create a deterministic local simulation script in scratch
-        scratch_dir = Path("/home/enki/scratch")
+        scratch_dir = scratch_root
         scratch_dir.mkdir(parents=True, exist_ok=True)
         script_to_run = str(scratch_dir / "default_sim_runner.py")
         with open(script_to_run, "w", encoding="utf-8") as sf:

@@ -16,9 +16,9 @@ import os
 import sys
 import json
 import re
+import shlex
 import subprocess
 import time
-import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import requests
@@ -56,8 +56,12 @@ OSIRIS physical constants (treat as first-class in all OSIRIS code):
   CHI_PC = 0.946                 (Phase-conjugate fidelity)
 
 CCCE metrics (Λ, Φ, Γ, Ξ) appear throughout the codebase — use them consistently.
-The unified OSIRIS package is in /home/enki/osiris/ (90 modules, 16 subpackages).
 Entry point: osiris_launcher.py → osiris_launcher:main
+
+Every tool call is authorized by the OSIRIS CapabilityGovernor. Reads are confined to
+the active workspace; write_file and run_bash need a human approval and may be denied.
+A DENIED result is final for that call — explain it instead of retrying the same action.
+run_bash executes one program with arguments, without a shell: no pipes, redirects or &&.
 
 Be direct and concise. Devin is a senior quantum systems engineer — no hand-holding."""
 
@@ -248,21 +252,51 @@ _DANGEROUS_PATTERNS = [
     r"wget.*\|\s*bash",
 ]
 
+#: Tokens that only mean something to a shell. run_bash has no shell, so a model
+#: emitting them expects behaviour that will not happen; refuse with a clear reason.
+_SHELL_ONLY_TOKENS = {"|", "||", "&&", ";", "&", ">", ">>", "<", "<<", "2>", "2>&1", "&>"}
+
+
 def tool_run_bash(command: str, cwd: Optional[str] = None, timeout: int = 60) -> str:
     for pat in _DANGEROUS_PATTERNS:
         if re.search(pat, command):
             return f"BLOCKED: matches dangerous pattern. Command: {command[:100]}"
     try:
+        argv = shlex.split(command)
+    except ValueError as ex:
+        return f"ERROR: cannot parse command: {ex}"
+    if not argv:
+        return "ERROR: empty command"
+    shell_tokens = [tok for tok in argv if tok in _SHELL_ONLY_TOKENS or tok.startswith("$(")]
+    if shell_tokens:
+        return (f"BLOCKED: shell syntax {shell_tokens} is not supported — run_bash executes "
+                f"a single program without a shell")
+
+    from osiris.substrate import interactive_timeout_s
+    horizon = interactive_timeout_s()
+    try:
+        effective_timeout = min(float(timeout), horizon) if timeout else horizon
+    except (TypeError, ValueError):
+        effective_timeout = horizon
+
+    work_dir = Path(cwd).expanduser().resolve() if cwd else Path.cwd()
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (str(work_dir), env.get("PYTHONPATH", "")) if p
+    )
+    try:
         result = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            timeout=timeout, cwd=cwd, env={**os.environ, "PYTHONPATH": "/home/enki"}
+            argv, shell=False, capture_output=True, text=True,
+            timeout=effective_timeout, cwd=str(work_dir), env=env,
         )
         out = result.stdout + (("\n[stderr]\n" + result.stderr) if result.stderr.strip() else "")
         if len(out) > 10_000:
             out = out[:5000] + f"\n...[{len(out)-5000} chars truncated]...\n" + out[-2000:]
         return out or f"(exit code {result.returncode}, no output)"
     except subprocess.TimeoutExpired:
-        return f"TIMEOUT after {timeout}s"
+        return f"TIMEOUT after {effective_timeout:.0f}s"
+    except FileNotFoundError:
+        return f"ERROR: program not found: {argv[0]}"
     except Exception as ex:
         return f"ERROR: {ex}"
 
@@ -289,15 +323,19 @@ def tool_list_dir(path: str, recursive: bool = False, pattern: str = "*") -> str
 
 
 def tool_grep_code(pattern: str, path: str, file_type: str = "") -> str:
-    include = f"--include='*.{file_type}'" if file_type else ""
-    cmd = f"grep -rn {include} -E {repr(pattern)} {repr(path)} 2>/dev/null | head -120"
+    # argv form, never a shell: the pattern comes from the model.
+    argv = ["grep", "-rnE"]
+    if file_type:
+        argv.append(f"--include=*.{file_type.lstrip('.')}")
+    argv += ["--", pattern, str(Path(path).expanduser())]
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-        return r.stdout or "(no matches)"
+        r = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
         return "TIMEOUT"
     except Exception as ex:
         return f"ERROR: {ex}"
+    lines = r.stdout.splitlines()[:120]
+    return "\n".join(lines) if lines else "(no matches)"
 
 
 def tool_remember(key: str, value: str) -> str:
@@ -534,8 +572,13 @@ def ingest_text(path: str) -> str:
 
 
 # ── Ollama Client ─────────────────────────────────────────────────────────────
-def ollama_chat(messages: List[Dict], tools: Optional[List] = None, timeout: int = TIMEOUT) -> Dict:
-    payload: Dict = {"model": MODEL, "messages": messages, "stream": False}
+def ollama_chat(
+    messages: List[Dict],
+    tools: Optional[List] = None,
+    timeout: int = TIMEOUT,
+    model: Optional[str] = None,
+) -> Dict:
+    payload: Dict = {"model": model or MODEL, "messages": messages, "stream": False}
     if tools:
         payload["tools"] = tools
     try:
@@ -543,55 +586,14 @@ def ollama_chat(messages: List[Dict], tools: Optional[List] = None, timeout: int
         r.raise_for_status()
         return r.json()
     except requests.exceptions.Timeout:
-        return {"error": f"Timeout after {timeout}s. If first run, qwen2.5:7b is loading — wait 60s and retry."}
+        return {"error": f"Timeout after {timeout}s. If first run, {model or MODEL} is loading — wait 60s and retry."}
     except requests.exceptions.ConnectionError:
         return {"error": f"Cannot reach Ollama at {OLLAMA_URL}. Run: ollama serve"}
     except Exception as ex:
         return {"error": str(ex)}
 
 
-def dispatch_tool(name: str, args: Dict) -> str:
-    fn = TOOL_MAP.get(name)
-    if not fn:
-        return f"Unknown tool: {name}"
-    try:
-        return fn(**args)
-    except TypeError as ex:
-        return f"Bad args for {name}: {ex}"
-    except Exception as ex:
-        return f"Error in {name}: {ex}"
-
-
-def execute_tool_calls(tool_calls: List[Dict]) -> List[Dict]:
-    results = []
-    for tc in tool_calls:
-        fn = tc.get("function", {})
-        name = fn.get("name", "")
-        args_raw = fn.get("arguments", "{}")
-        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-        # Pretty print tool call
-        args_display = ", ".join(f"{k}={repr(v)[:50]}" for k, v in args.items())
-        print(f"\033[90m  ▸ {name}({args_display})\033[0m")
-        result = dispatch_tool(name, args)
-        if len(result) > 6000:
-            result = result[:3000] + f"\n...[truncated — {len(result)-3000} chars omitted]...\n" + result[-1500:]
-        results.append({"role": "tool", "content": result, "name": name})
-    return results
-
-
-# ── REPL ──────────────────────────────────────────────────────────────────────
-_HELP = """
-Commands:
-  /scan <dir>      — Index a codebase directory
-  /ingest <file>   — Ingest chat log or notes into memory
-  /audit <dir>     — Security audit of a git repo
-  /memory          — Show all stored memory
-  /sprint          — Show sprint board
-  /clear           — Clear conversation context (keeps memory)
-  /model <name>    — Switch Ollama model
-  /quit            — Exit
-"""
-
+# ── Prompt ────────────────────────────────────────────────────────────────────
 def build_system_prompt() -> str:
     sys = SYSTEM_PROMPT
     if INDEX_FILE.exists():
@@ -607,114 +609,51 @@ def build_system_prompt() -> str:
     return sys
 
 
-def repl():
-    global MODEL
+# ── Compatibility entry points ───────────────────────────────────────────────
+# The interactive surface is osiris_cli; tool calls run through
+# osiris.agents.gateway.adapters.LocalBrainAdapter under the CapabilityGovernor.
+
+def _copilot(argv: List[str]) -> int:
+    from osiris_cli.app import main as copilot_main
+    return copilot_main(argv)
+
+
+def repl(model: Optional[str] = None, workspace: str = ".", mode: str = "edit") -> int:
+    """Interactive session — delegates to the osiris_cli REPL with the brain backend."""
+    return _copilot(["--model", model or MODEL, "--workspace", workspace, "--mode", mode])
+
+
+def ask(query: str, model: Optional[str] = None, workspace: str = ".", mode: str = "edit") -> int:
+    """One-shot query through the same governed path as the REPL."""
+    return _copilot(["--model", model or MODEL, "--workspace", workspace, "--mode", mode,
+                     "-c", query])
+
+
+def _print_hardware() -> None:
+    print("=" * 65)
+    print("OSIRIS HARDWARE MESH DETECTOR — TOPOLOGY REPORT")
+    print("=" * 65)
+    print(f"Classification  : {PROFILE.node_type.value}")
+    print(f"Machine Arch    : {PROFILE.machine_arch}")
+    print(f"CPU Model       : {PROFILE.cpu_model}")
+    print(f"Cores Available : {PROFILE.cpu_cores}")
+    print(f"Termux Userland : {PROFILE.is_termux}")
+    print(f"Intel Arc Accel : {PROFILE.has_intel_arc}")
+    print(f"Timeout Horizon : {PROFILE.execution_timeout_s}s (Extended={PROFILE.allow_extended_horizons})")
+    print("=" * 65)
+
+
+def write_index(root: str) -> Dict:
+    print(f"Scanning {root}...")
     MEMORY_DIR.mkdir(exist_ok=True)
-
-    messages = [{"role": "system", "content": build_system_prompt()}]
-
-    term_width = shutil.get_terminal_size((80, 24)).columns
-    print("\n" + "─" * term_width)
-    print("  OSIRIS Brain  ·  Sovereign Coding Assistant")
-    print(f"  Model: {MODEL}   Ollama: {OLLAMA_URL}")
-    print(f"  Memory: {MEMORY_FILE}")
-    print(f"  Type /help for commands")
-    print("─" * term_width + "\n")
-
-    while True:
-        try:
-            user_input = input("\033[36myou>\033[0m ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nbye.")
-            break
-
-        if not user_input:
-            continue
-
-        # ── Slash commands ────────────────────────────────────────────────────
-        if user_input in ("/quit", "/exit", "/q"):
-            print("bye.")
-            break
-
-        if user_input == "/help":
-            print(_HELP)
-            continue
-
-        if user_input.startswith("/scan "):
-            dir_path = user_input[6:].strip()
-            print(f"Scanning {dir_path}...")
-            idx = scan_repo(dir_path)
-            INDEX_FILE.write_text(json.dumps(idx, indent=2))
-            print(f"Indexed {idx['file_count']} files → {INDEX_FILE}")
-            messages[0]["content"] = build_system_prompt()
-            continue
-
-        if user_input.startswith("/ingest "):
-            fp = user_input[8:].strip()
-            print(ingest_text(fp))
-            messages[0]["content"] = build_system_prompt()
-            continue
-
-        if user_input.startswith("/audit "):
-            rp = user_input[7:].strip()
-            print(audit_repo(rp))
-            continue
-
-        if user_input == "/memory":
-            print(tool_recall("all"))
-            continue
-
-        if user_input == "/sprint":
-            print(tool_sprint_task("list"))
-            continue
-
-        if user_input == "/clear":
-            messages = [messages[0]]
-            print("Context cleared (memory retained).")
-            continue
-
-        if user_input.startswith("/model "):
-            MODEL = user_input[7:].strip()
-            print(f"Switched to {MODEL}")
-            continue
-
-        # ── Agent loop ────────────────────────────────────────────────────────
-        messages.append({"role": "user", "content": user_input})
-
-        for iteration in range(12):
-            resp = ollama_chat(messages, tools=TOOLS)
-
-            if "error" in resp:
-                print(f"\n\033[31m[ERROR]\033[0m {resp['error']}\n")
-                messages.pop()
-                break
-
-            msg = resp.get("message", {})
-            tool_calls = msg.get("tool_calls", [])
-
-            if tool_calls:
-                messages.append({
-                    "role": "assistant",
-                    "content": msg.get("content", ""),
-                    "tool_calls": tool_calls
-                })
-                tool_results = execute_tool_calls(tool_calls)
-                messages.extend(tool_results)
-            else:
-                answer = msg.get("content", "(no response)")
-                print(f"\n\033[32mosiris>\033[0m {answer}\n")
-                messages.append({"role": "assistant", "content": answer})
-                break
-        else:
-            print("\033[33m[max iterations reached]\033[0m")
-
-        # Keep context window manageable: trim to last 30 messages (keep system)
-        if len(messages) > 32:
-            messages = [messages[0]] + messages[-30:]
+    idx = scan_repo(root)
+    INDEX_FILE.write_text(json.dumps(idx, indent=2))
+    print(f"Indexed {idx['file_count']} files → {INDEX_FILE}")
+    return idx
 
 
-# ── CLI Entry ─────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def main(argv: Optional[List[str]] = None) -> int:
+    global MODEL
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -728,79 +667,56 @@ if __name__ == "__main__":
     parser.add_argument("--audit", metavar="DIR", help="Security audit a git repo")
     parser.add_argument("--memory", action="store_true", help="Show memory and exit")
     parser.add_argument("--model", default=MODEL, help=f"Ollama model (default: {MODEL})")
+    parser.add_argument("--workspace", default=".", help="Workspace root tool calls are confined to")
+    parser.add_argument("--mode", default="edit",
+                        help="osiris_cli mode; edit allows approved writes and commands")
     parser.add_argument("--sprint", action="store_true", help="Show sprint board and exit")
     parser.add_argument("--hardware", action="store_true", help="Report hardware substrate profile and exit")
     parser.add_argument("--benchmark", metavar="TARGET", nargs="?", const="ibm_torino", help="Run 11D-CRSM benchmark on target backend")
     parser.add_argument("--mutate", metavar="TARGET", nargs="?", const="ibm_torino", help="Trigger autonomous mutation loop on target backend")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     MODEL = args.model
 
     if args.hardware:
-        print("=" * 65)
-        print("OSIRIS HARDWARE MESH DETECTOR — TOPOLOGY REPORT")
-        print("=" * 65)
-        print(f"Classification  : {PROFILE.node_type.value}")
-        print(f"Machine Arch    : {PROFILE.machine_arch}")
-        print(f"CPU Model       : {PROFILE.cpu_model}")
-        print(f"Cores Available : {PROFILE.cpu_cores}")
-        print(f"Termux Userland : {PROFILE.is_termux}")
-        print(f"Intel Arc Accel : {PROFILE.has_intel_arc}")
-        print(f"Timeout Horizon : {PROFILE.execution_timeout_s}s (Extended={PROFILE.allow_extended_horizons})")
-        print("=" * 65)
-        sys.exit(0)
+        _print_hardware()
+        return 0
 
     if args.benchmark:
         from osiris_edge_quantum_loop import execute_crsm_benchmark
         execute_crsm_benchmark(backend_name=args.benchmark)
-        sys.exit(0)
+        return 0
 
     if args.mutate:
         from osiris_edge_quantum_loop import trigger_dna_mutation
         trigger_dna_mutation(backend_name=args.mutate)
-        sys.exit(0)
+        return 0
 
     if args.memory:
         print(tool_recall("all"))
-        sys.exit(0)
+        return 0
 
     if args.sprint:
         print(tool_sprint_task("list"))
-        sys.exit(0)
+        return 0
 
     if args.scan:
-        print(f"Scanning {args.scan}...")
-        idx = scan_repo(args.scan)
-        INDEX_FILE.write_text(json.dumps(idx, indent=2))
-        print(f"Indexed {idx['file_count']} files → {INDEX_FILE}")
-        sys.exit(0)
+        write_index(args.scan)
+        return 0
 
     if args.ingest:
         print(ingest_text(args.ingest))
-        sys.exit(0)
+        return 0
 
     if args.audit:
         print(audit_repo(args.audit))
-        sys.exit(0)
+        return 0
 
     if args.query:
-        messages = [
-            {"role": "system", "content": build_system_prompt()},
-            {"role": "user", "content": args.query}
-        ]
-        for _ in range(8):
-            resp = ollama_chat(messages, tools=TOOLS)
-            if "error" in resp:
-                print(f"Error: {resp['error']}")
-                sys.exit(1)
-            msg = resp.get("message", {})
-            tc = msg.get("tool_calls", [])
-            if tc:
-                messages.append({"role": "assistant", "content": msg.get("content", ""), "tool_calls": tc})
-                messages.extend(execute_tool_calls(tc))
-            else:
-                print(msg.get("content", ""))
-                break
-        sys.exit(0)
+        return ask(args.query, model=args.model, workspace=args.workspace, mode=args.mode)
 
-    repl()
+    return repl(model=args.model, workspace=args.workspace, mode=args.mode)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

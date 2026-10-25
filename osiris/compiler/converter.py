@@ -8,6 +8,8 @@ Mirrors the dnalang-organism-converter Converter.translate() pattern:
   qasm = converter.export(translated, format="qasm")
 """
 
+from __future__ import annotations
+
 import hashlib
 import time
 from collections import Counter

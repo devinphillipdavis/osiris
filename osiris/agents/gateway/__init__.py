@@ -9,11 +9,13 @@ from .contracts import (
     AuthorizedAgentRequest,
     BudgetClass,
     ExecutionGrant,
+    HumanApproval,
     ProposalProvenance,
     RiskTier,
     canonical_json,
     compute_sha256,
 )
+from .execution import GovernanceDecision, GovernedExecutor, build_proposal
 from .gateway import AgentGateway, GatewayResponse
 from .governor import CapabilityGovernor, GovernanceViolation
 from .router import ModelRouter, RoutingError
@@ -27,6 +29,7 @@ __all__ = [
     "AuthorizedAgentRequest",
     "BudgetClass",
     "ExecutionGrant",
+    "HumanApproval",
     "ProposalProvenance",
     "RiskTier",
     "canonical_json",
@@ -35,6 +38,9 @@ __all__ = [
     "GatewayResponse",
     "CapabilityGovernor",
     "GovernanceViolation",
+    "GovernanceDecision",
+    "GovernedExecutor",
+    "build_proposal",
     "ModelRouter",
     "RoutingError",
 ]

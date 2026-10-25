@@ -26,6 +26,10 @@ class ModelRouter:
         if "antigravity" in self._adapters:
             return self._adapters["antigravity"]
 
+        # Local Ollama brain: data never leaves the node
+        if "local_brain" in self._adapters:
+            return self._adapters["local_brain"]
+
         if "replay" in self._adapters:
             return self._adapters["replay"]
 

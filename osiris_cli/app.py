@@ -11,13 +11,12 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path  # noqa: F401
+from typing import List, Optional
 
 from osiris_cli.repl import OsirisREPL
-from osiris_cli.session_manager import SessionManager  # noqa: F401
 
 
-def main() -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="osiris",
         description="OSIRIS Conversational Terminal REPL & Evidence-Governed Engineering Copilot"
@@ -25,10 +24,11 @@ def main() -> int:
     parser.add_argument("-w", "--workspace", default=".", help="Target workspace path")
     parser.add_argument("-s", "--session", help="Session ID to resume or create")
     parser.add_argument("-m", "--mode", default="inspect", help="Initial interaction mode")
-    parser.add_argument("--model", default="local_nclm", help="Active model adapter")
+    parser.add_argument("--model", default="local_nclm",
+                        help="local_nclm (templated) or an Ollama model name (governed tool use)")
     parser.add_argument("-c", "--command", help="Execute single prompt or slash command and exit")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     repl = OsirisREPL(
         workspace_root=args.workspace,

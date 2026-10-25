@@ -45,12 +45,23 @@ def check_environment():
 
     print("\n" + "="*70)
 
-def cmd_chat(args):
-    """Launch chat-native TUI"""
-    print("\n⚛ Launching OSIRIS Chat Interface...\n")
+def _run_copilot(argv):
+    """Single interactive surface: the osiris_cli REPL / one-shot router."""
+    from osiris_cli.app import main as copilot_main
+    return copilot_main(argv)
 
-    from osiris_tui_core import run_textual_mode
-    run_textual_mode()
+
+def cmd_chat(args):
+    """Launch the osiris_cli copilot REPL (``--tui`` keeps the Textual interface)."""
+    if getattr(args, 'tui', False):
+        print("\n⚛ Launching OSIRIS Chat Interface (Textual TUI)...\n")
+        from osiris_tui_core import run_textual_mode
+        run_textual_mode()
+        return 0
+    argv = ['--model', getattr(args, 'model', None) or 'local_nclm',
+            '--workspace', getattr(args, 'workspace', None) or '.',
+            '--mode', getattr(args, 'mode', None) or 'inspect']
+    return _run_copilot(argv)
 
 def cmd_benchmark(args):
     """Run quantum hardware benchmarking"""
@@ -178,16 +189,52 @@ def cmd_status(args):
     print("\n" + "="*70)
 
 
+COPILOT_SDK_ENV = 'OSIRIS_COPILOT_SDK_DIR'
+
+
+def _load_copilot_intent_router():
+    """Resolve the copilot-sdk-dnalang intent router on demand.
+
+    Looks in ``$OSIRIS_COPILOT_SDK_DIR`` first, then the sibling checkout
+    ``osiris-unified-substrate/copilot-sdk-dnalang/src`` next to this file. The
+    directory is added to ``sys.path`` only if it exists, and removed again if the
+    import fails, so a missing SDK never leaves a stale path entry behind.
+    """
+    candidates = []
+    env_dir = os.environ.get(COPILOT_SDK_ENV, '').strip()
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser())
+    candidates.append(Path(__file__).resolve().parent / 'osiris-unified-substrate'
+                      / 'copilot-sdk-dnalang' / 'src')
+
+    sdk_root = next((c for c in candidates if (c / 'dnalang_sdk').is_dir()), None)
+    if sdk_root is None:
+        searched = ', '.join(str(c) for c in candidates)
+        raise ImportError(
+            f"copilot-sdk-dnalang not found (searched: {searched}). "
+            f"Set {COPILOT_SDK_ENV} to its 'src' directory."
+        )
+
+    entry = str(sdk_root)
+    added = entry not in sys.path
+    if added:
+        sys.path.insert(0, entry)
+    try:
+        from dnalang_sdk.nclm.intent_router import get_intent_router
+    except Exception:
+        if added and entry in sys.path:
+            sys.path.remove(entry)
+        raise
+    return get_intent_router
+
+
 def cmd_intent(args):
     """Route free-text instructions through the NCLM intent router."""
     print("\n⚛ Routing natural language intent...\n")
     try:
-        router_root = Path(__file__).parent / "osiris-unified-substrate" / "copilot-sdk-dnalang" / "src"
-        sys.path.insert(0, str(router_root))
-        from dnalang_sdk.nclm.intent_router import get_intent_router
+        get_intent_router = _load_copilot_intent_router()
     except Exception as exc:
         print(f"⚠ Intent router unavailable: {exc}")
-        print("Please ensure osiris-unified-substrate/copilot-sdk-dnalang/src is present and importable.")
         return
 
     router = get_intent_router(use_llm=not args.no_llm)
@@ -1097,32 +1144,35 @@ def cmd_fleet(args):
 
 
 def cmd_brain(args):
-    """Launch OSIRIS Brain — local coding assistant (Claude Code / Copilot replacement)"""
-    import subprocess
-    import sys
-    brain_path = os.path.join(os.path.dirname(__file__), "osiris_brain.py")
-    if not os.path.exists(brain_path):
-        print("ERROR: osiris_brain.py not found alongside osiris_launcher.py")
-        sys.exit(1)
+    """OSIRIS Brain — governed local coding assistant, served by the osiris_cli surface.
 
-    cmd = [sys.executable, brain_path]
+    Utility flags run in-process; a query or a bare ``osiris brain`` goes through
+    osiris_cli with the LocalBrainAdapter, so every tool call is governed.
+    """
+    import osiris_brain
+
+    argv = []
     if getattr(args, "scan", None):
-        cmd += ["--scan", args.scan]
+        argv += ["--scan", args.scan]
     elif getattr(args, "ingest", None):
-        cmd += ["--ingest", args.ingest]
+        argv += ["--ingest", args.ingest]
     elif getattr(args, "audit", None):
-        cmd += ["--audit", args.audit]
+        argv += ["--audit", args.audit]
     elif getattr(args, "memory", False):
-        cmd += ["--memory"]
+        argv += ["--memory"]
     elif getattr(args, "sprint", False):
-        cmd += ["--sprint"]
+        argv += ["--sprint"]
     elif getattr(args, "query", None):
-        cmd += [args.query]
+        argv += [args.query]
 
     if getattr(args, "model", None):
-        cmd += ["--model", args.model]
+        argv += ["--model", args.model]
+    if getattr(args, "workspace", None):
+        argv += ["--workspace", args.workspace]
+    if getattr(args, "mode", None):
+        argv += ["--mode", args.mode]
 
-    subprocess.run(cmd)
+    return osiris_brain.main(argv)
 
 
 def cmd_help(args):
@@ -1455,9 +1505,17 @@ def main():
     brain_parser.add_argument('--memory', action='store_true', help='Show stored memory')
     brain_parser.add_argument('--sprint', action='store_true', help='Show sprint board')
     brain_parser.add_argument('--model', default='qwen2.5:7b', help='Ollama model to use')
+    brain_parser.add_argument('--workspace', default='.', help='Workspace root tool calls are confined to')
+    brain_parser.add_argument('--mode', default='edit',
+                              help='osiris_cli mode (edit allows approved writes and commands)')
 
     # Chat command
-    subparsers.add_parser('chat', help='Launch chat interface')
+    chat_parser = subparsers.add_parser('chat', help='Launch the osiris_cli copilot REPL')
+    chat_parser.add_argument('--model', default='local_nclm',
+                             help='local_nclm (templated) or an Ollama model (governed)')
+    chat_parser.add_argument('--workspace', default='.', help='Workspace root')
+    chat_parser.add_argument('--mode', default='inspect', help='Initial interaction mode')
+    chat_parser.add_argument('--tui', action='store_true', help='Use the Textual TUI instead')
 
     # Benchmark command
     bench_parser = subparsers.add_parser('benchmark', help='Run benchmarking')

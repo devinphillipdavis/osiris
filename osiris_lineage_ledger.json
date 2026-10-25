@@ -1,6 +1,6 @@
 [
   {
-    "lineage_hash": "09b6fa4ed2cdc4c2d212715a2a80a9e2949cab40a0ee2ddb65a0d9e50688cfa0",
+    "lineage_hash": "617d80cabed9fc653405921788b5cb0d1bc797b64102ea84a58c40d71c1aab04",
     "generation": 1,
     "parent_hash": null,
     "intent_proof_hash": "170f716432875c8a5d02bf1545d75d306d3f172b7a09f885c429e874236d500c",
@@ -11,6 +11,6 @@
     "xi_efficiency": 43.59757186267519,
     "status": "ACTIVE_VERIFIED",
     "node_executed": "NODE_BETA_COMPUTE",
-    "timestamp": 1792910209.373585
+    "timestamp": 1792911643.2421007
   }
 ]
