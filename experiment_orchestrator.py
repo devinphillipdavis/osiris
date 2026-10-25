@@ -33,7 +33,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from occr_governance_engine import (
     CapabilityRecord,
-    ClaimCeiling,
     DeploymentAuthority,
     EvidenceStatus,
     ExecutionGate,
@@ -46,54 +45,8 @@ from occr_governance_engine import (
 )
 
 
-#: Projection from the ``osiris_claim_closure`` string lattice onto the OCCR
-#: ``ClaimCeiling`` IntEnum. The string lattice is finer-grained, so names with no
-#: OCCR counterpart round DOWN to the nearest member that does exist — a ceiling
-#: may never be projected upward into a stronger claim than it was granted.
-_STRING_LATTICE_TO_OCCR = {
-    "NO_CLAIM": ClaimCeiling.NO_CLAIM,
-    "HYPOTHESIS": ClaimCeiling.HYPOTHESIS,
-    "ANALYSIS_ONLY": ClaimCeiling.HYPOTHESIS,
-    "IMPLEMENTED_CANDIDATE": ClaimCeiling.IMPLEMENTATION_ONLY,
-    "IMPLEMENTATION_ONLY": ClaimCeiling.IMPLEMENTATION_ONLY,
-    "LOCAL_TEST_RESULT": ClaimCeiling.IMPLEMENTATION_ONLY,
-    "TESTED": ClaimCeiling.TESTED,
-    "MEASURED": ClaimCeiling.TESTED,
-    "EMPIRICAL_RESULT": ClaimCeiling.EMPIRICAL_RESULT,
-    "REPRODUCED": ClaimCeiling.EMPIRICAL_RESULT,
-    "BOUNDED_EXPLORATORY_OBSERVATION": ClaimCeiling.EMPIRICAL_RESULT,
-    "REPRODUCIBILITY": ClaimCeiling.REPRODUCIBILITY,
-    "INDEPENDENTLY_REPLICATED": ClaimCeiling.REPRODUCIBILITY,
-    "PRODUCT_CAPABILITY": ClaimCeiling.PRODUCT_CAPABILITY,
-    "VERIFIED": ClaimCeiling.VERIFIED,
-}
-
-
-def resolve_claim_ceiling(value: Any) -> ClaimCeiling:
-    """Coerce a preregistered claim ceiling into an OCCR ``ClaimCeiling``.
-
-    Accepts an existing member, an int rank, or a lattice name from either
-    vocabulary. Anything unrecognized fails closed to ``NO_CLAIM`` rather than
-    inheriting a permissive default (Invariant 4).
-    """
-    if isinstance(value, ClaimCeiling):
-        return value
-    if isinstance(value, bool):
-        return ClaimCeiling.NO_CLAIM
-    if isinstance(value, int):
-        try:
-            return ClaimCeiling(value)
-        except ValueError:
-            return ClaimCeiling.NO_CLAIM
-    if isinstance(value, str):
-        name = value.strip().upper()
-        if name in _STRING_LATTICE_TO_OCCR:
-            return _STRING_LATTICE_TO_OCCR[name]
-        try:
-            return ClaimCeiling[name]
-        except KeyError:
-            return ClaimCeiling.NO_CLAIM
-    return ClaimCeiling.NO_CLAIM
+# Backwards-compatible shim: the canonical resolver lives with the lattice.
+from osiris_claim_closure import resolve_claim_ceiling  # noqa: F401
 
 
 @dataclass

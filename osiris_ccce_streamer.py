@@ -157,23 +157,15 @@ class FeedbackAction:
         }
 
 
-def default_ledger_path() -> Path:
-    """Where telemetry is written when no explicit path is given.
-
-    Set OSIRIS_PCRB_LEDGER to override; otherwise the ledger lives under the
-    current user's home, so the module stays importable off the author's box.
-    """
-    override = os.environ.get("OSIRIS_PCRB_LEDGER")
-    if override:
-        return Path(override)
-    return Path.home() / ".osiris" / "evidence" / "pcrb_telemetry_ledger.jsonl"
-
-
 class PCRBTelemetryLedger:
     """Tamper-evident append-only ledger for CCCE and PCRB telemetry."""
 
     def __init__(self, ledger_path: Optional[Path] = None):
-        self.ledger_path = Path(ledger_path) if ledger_path else default_ledger_path()
+        default_ledger = os.environ.get(
+            "OSIRIS_PCRB_LEDGER",
+            str(Path.home() / ".osiris" / "evidence" / "pcrb_telemetry_ledger.jsonl"),
+        )
+        self.ledger_path = ledger_path or Path(default_ledger)
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
         self.last_hash: str = "0" * 64
         self._lock = threading.Lock()

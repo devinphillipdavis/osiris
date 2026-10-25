@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 from ..contracts import AgentResult, AuthorizedAgentRequest
 from ..execution import Approver, GovernanceDecision, GovernedExecutor
@@ -54,6 +55,68 @@ def _sha256(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+#: Model families that write tool calls into ``message.content`` as JSON text
+#: instead of Ollama's structured ``tool_calls``. Prefix match on the model name.
+TEXT_TOOL_CALL_MODELS = ("qwen2.5-coder",)
+
+_FENCE = re.compile(r"```(?:json)?[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def _as_tool_call(obj: Any, known_tools: Iterable[str]) -> Optional[Dict[str, Any]]:
+    """Normalize ``{"name","arguments"}`` or ``{"tool","kwargs"}`` to the native shape."""
+    if not isinstance(obj, dict):
+        return None
+    if "name" in obj and "arguments" in obj:
+        name, arguments = obj.get("name"), obj.get("arguments")
+    elif "tool" in obj and "kwargs" in obj:
+        name, arguments = obj.get("tool"), obj.get("kwargs")
+    else:
+        return None
+    if not isinstance(name, str) or name not in set(known_tools):
+        return None
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            return None
+    if not isinstance(arguments, dict):
+        return None
+    return {"function": {"name": name, "arguments": arguments}}
+
+
+def parse_text_tool_calls(content: str, known_tools: Iterable[str]) -> List[Dict[str, Any]]:
+    """Extract tool calls a model wrote as JSON text, in order of appearance.
+
+    Looks at fenced ```json blocks first, then at top-level JSON objects in the
+    remaining prose. Only objects naming a known tool with a JSON-object argument
+    set count; malformed JSON, unknown tools and ordinary prose yield nothing.
+    Parsing grants nothing — every result still goes through the governor.
+    """
+    if not content or "{" not in content:
+        return []
+    known = list(known_tools)
+    decoder = json.JSONDecoder()
+    calls: List[Dict[str, Any]] = []
+
+    def scan(text: str) -> None:
+        i = text.find("{")
+        while i != -1:
+            try:
+                obj, end = decoder.raw_decode(text, i)
+            except ValueError:
+                i = text.find("{", i + 1)
+                continue
+            call = _as_tool_call(obj, known)
+            if call is not None:
+                calls.append(call)
+            i = text.find("{", end)
+
+    for match in _FENCE.finditer(content):
+        scan(match.group(1))
+    scan(_FENCE.sub(" ", content))
+    return calls
+
+
 class LocalBrainAdapter:
     """AgentAdapter over a local Ollama model and the governed brain tool set."""
 
@@ -68,6 +131,7 @@ class LocalBrainAdapter:
         governor: Optional[CapabilityGovernor] = None,
         chat_fn: Optional[ChatFn] = None,
         max_iterations: int = 12,
+        text_tool_calls: Optional[bool] = None,
     ):
         self.workspace_root = Path(workspace_root).resolve()
         self.model = model
@@ -77,6 +141,8 @@ class LocalBrainAdapter:
         self._approver = approver
         self._state_governor: Optional[CapabilityGovernor] = None
         self._history: List[Dict[str, Any]] = []
+        # None = automatic: on only for model families known to emit text tool calls.
+        self._text_tool_calls = text_tool_calls
 
     # ── AgentAdapter protocol ────────────────────────────────────────────────
     def capabilities(self) -> frozenset[str]:
@@ -98,6 +164,12 @@ class LocalBrainAdapter:
     def set_model(self, model: str) -> None:
         self.model = model
 
+    def text_tool_calls_enabled(self) -> bool:
+        if self._text_tool_calls is not None:
+            return self._text_tool_calls
+        name = (self.model or "").lower()
+        return any(name.startswith(prefix) for prefix in TEXT_TOOL_CALL_MODELS)
+
     def refresh_system_prompt(self) -> None:
         """Rebuild the system prompt in place (after /scan or /ingest) keeping the conversation."""
         if self._history:
@@ -113,6 +185,7 @@ class LocalBrainAdapter:
 
         tokens = 0
         tool_calls_made = 0
+        text_calls_parsed = 0
         status, output, error = "MAX_ITERATIONS", None, "model did not finish within the iteration budget"
 
         for _ in range(self.max_iterations):
@@ -125,6 +198,11 @@ class LocalBrainAdapter:
 
             msg = resp.get("message", {}) or {}
             tool_calls = msg.get("tool_calls") or []
+            origin = "native"
+            if not tool_calls and self.text_tool_calls_enabled():
+                tool_calls = parse_text_tool_calls(msg.get("content", "") or "", brain.TOOL_MAP)
+                origin = "text"
+                text_calls_parsed += len(tool_calls)
             if not tool_calls:
                 output = msg.get("content", "") or "(no response)"
                 self._history.append({"role": "assistant", "content": output})
@@ -148,7 +226,7 @@ class LocalBrainAdapter:
                 if args is None:
                     content = f"ERROR: arguments for {name} are not a JSON object"
                 else:
-                    content = self.dispatch(request, name, args, executor=executor)
+                    content = self.dispatch(request, name, args, executor=executor, origin=origin)
                 if len(content) > _MAX_TOOL_RESULT_CHARS:
                     content = (content[:3000]
                                + f"\n...[truncated — {len(content) - 3000} chars omitted]...\n"
@@ -168,6 +246,7 @@ class LocalBrainAdapter:
                 "tokens": tokens,
                 "cost_usd": 0.0,
                 "tool_calls": tool_calls_made,
+                "text_tool_calls": text_calls_parsed,
                 "granted": sum(1 for d in executor.ledger if d.granted),
                 "denied": sum(1 for d in executor.ledger if not d.granted),
                 "governance": ledger,
@@ -183,6 +262,7 @@ class LocalBrainAdapter:
         name: str,
         args: Dict[str, Any],
         executor: Optional[GovernedExecutor] = None,
+        origin: str = "native",
     ) -> str:
         """Authorize and run one tool call; always returns text for the model."""
         brain = _brain()
@@ -216,6 +296,10 @@ class LocalBrainAdapter:
             gov_executor = executor
 
         arguments, content_digest, description = self._describe(name, args, locator)
+        # Digest-bound, so the audit trail shows whether the call was parsed from text.
+        arguments = {**arguments, "tool_call_origin": origin}
+        if origin != "native":
+            description = f"{description} [parsed from {origin}]"
         decision, proposal, grant = gov_executor.authorize(
             request, capability, locator, arguments, description,
             content_digest=content_digest,
@@ -278,4 +362,8 @@ class LocalBrainAdapter:
 
     def _system_prompt(self) -> str:
         prompt = _brain().build_system_prompt()
-        return prompt + f"\n\nActive workspace (tool calls are confined here): {self.workspace_root}"
+        return prompt + (
+            f"\n\nActive workspace (tool calls are confined here): {self.workspace_root}\n"
+            "Give tool paths relative to the active workspace (e.g. 'notes.txt'); paths "
+            "outside it, including the indexed codebase root, are denied."
+        )

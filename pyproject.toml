@@ -131,11 +131,10 @@ py-modules = [
     "nclm_research_adapter",
     "occr_governance_engine",
     "osiris_evidence_runtime_demo",
-    # Research pipeline modules imported by tests/
+    # Research and governance pipeline root modules
     "occr_claim_lattice",
     "physics_hypothesis_lab",
-    "experiment_orchestrator",
-    "evidence_and_claim_pipeline",
+    "experiment_orchestrator_pipeline",
     "research_cli",
 ]
 

@@ -48,7 +48,8 @@ class EvidenceStatus(str, enum.Enum):
     UNRESOLVED = "UNRESOLVED"
 
 
-# Claim Ceiling Total Ordering
+# Claim Ceiling Total Ordering — the single canonical OSIRIS claim lattice.
+# Rank is list position. occr_governance_engine.ClaimCeiling is this same enum.
 CLAIM_CEILING_ORDER = [
     "NO_CLAIM",
     "HYPOTHESIS",
@@ -65,11 +66,62 @@ CLAIM_CEILING_ORDER = [
     "VERIFIED"
 ]
 
-def ceiling_rank(ceiling: str) -> int:
+#: Legacy labels that name an existing rung. Enum aliases, never extra rungs.
+CLAIM_CEILING_ALIASES = {
+    "IMPLEMENTATION_ONLY": "IMPLEMENTED_CANDIDATE",  # former OCCR rung 2
+}
+
+#: Labels from other vocabularies (e.g. the separate osiris-governance package)
+#: projected DOWN onto the canonical rung that does not over-claim. They are not
+#: members of ClaimCeiling.
+FOREIGN_CEILING_LABELS = {
+    "BOUNDED_EXPLORATORY_OBSERVATION": "MEASURED",
+}
+
+ClaimCeiling = enum.IntEnum(
+    "ClaimCeiling",
+    [(name, rank) for rank, name in enumerate(CLAIM_CEILING_ORDER)]
+    + [(alias, CLAIM_CEILING_ORDER.index(target))
+       for alias, target in CLAIM_CEILING_ALIASES.items()],
+    module=__name__,
+)
+ClaimCeiling.__doc__ = (
+    "Ordered claim strength, generated from CLAIM_CEILING_ORDER. An evidence "
+    "status establishes an absolute ceiling above which no claim may be made."
+)
+
+
+def ceiling_rank(ceiling: Union[str, "ClaimCeiling"]) -> int:
+    """Rank of a canonical label or member; -1 for anything else."""
+    if isinstance(ceiling, ClaimCeiling):
+        return int(ceiling)
     try:
         return CLAIM_CEILING_ORDER.index(ceiling)
     except ValueError:
         return -1
+
+
+def resolve_claim_ceiling(value: Any) -> "ClaimCeiling":
+    """Coerce a member, rank, canonical label, alias or foreign label to a ClaimCeiling.
+
+    Anything unrecognized fails closed to NO_CLAIM rather than inheriting a
+    permissive default.
+    """
+    if isinstance(value, ClaimCeiling):
+        return value
+    if isinstance(value, bool):
+        return ClaimCeiling.NO_CLAIM
+    if isinstance(value, int):
+        try:
+            return ClaimCeiling(value)
+        except ValueError:
+            return ClaimCeiling.NO_CLAIM
+    if isinstance(value, str):
+        name = value.strip().upper()
+        name = FOREIGN_CEILING_LABELS.get(name, name)
+        if name in ClaimCeiling.__members__:
+            return ClaimCeiling[name]
+    return ClaimCeiling.NO_CLAIM
 
 
 @dataclass(frozen=True)

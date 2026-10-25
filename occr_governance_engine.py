@@ -26,6 +26,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from osiris_claim_closure import ClaimCeiling as _canonical_claim_ceiling
+
 
 # ============================================================================
 # 1. Orthogonal Status Dimensions & Controlled Vocabularies
@@ -59,20 +61,10 @@ class DeploymentAuthority(enum.Enum):
     PRODUCTION_APPROVED = "PRODUCTION_APPROVED"  # Unrestricted production execution authorized
 
 
-class ClaimCeiling(enum.IntEnum):
-    """
-    Ordered hierarchy of claim strength.
-    A capability's evidence status establishes an absolute ceiling above which
-    no claim may be made.
-    """
-    NO_CLAIM = 0
-    HYPOTHESIS = 1            # Theoretical mechanism; zero factual claims
-    IMPLEMENTATION_ONLY = 2   # Code exists and parses; no functional efficacy claimed
-    TESTED = 3                # Passes deterministic unit/integration assertion gates
-    EMPIRICAL_RESULT = 4      # Direct empirical measurement on specific physical setup
-    REPRODUCIBILITY = 5       # Replicated across independent environments/hardware
-    PRODUCT_CAPABILITY = 6    # Fully generalized, robust production software capability
-    VERIFIED = 7              # Independently audited, peer-reviewed, and externally confirmed
+# The canonical claim lattice lives in osiris_claim_closure. OCCR's former rungs
+# keep their relative order there (IMPLEMENTATION_ONLY is an alias of
+# IMPLEMENTED_CANDIDATE), so every gate comparison below is unchanged.
+ClaimCeiling = _canonical_claim_ceiling
 
 
 class ReviewIndependence(enum.Enum):

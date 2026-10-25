@@ -81,9 +81,9 @@ def test_antigravity_adapter_imports_without_the_optional_sdk():
     [
         ("NO_CLAIM", ClaimCeiling.NO_CLAIM),
         ("HYPOTHESIS", ClaimCeiling.HYPOTHESIS),
-        ("LOCAL_TEST_RESULT", ClaimCeiling.IMPLEMENTATION_ONLY),
+        ("LOCAL_TEST_RESULT", ClaimCeiling.LOCAL_TEST_RESULT),
         ("TESTED", ClaimCeiling.TESTED),
-        ("BOUNDED_EXPLORATORY_OBSERVATION", ClaimCeiling.EMPIRICAL_RESULT),
+        ("BOUNDED_EXPLORATORY_OBSERVATION", ClaimCeiling.MEASURED),
         ("VERIFIED", ClaimCeiling.VERIFIED),
     ],
 )

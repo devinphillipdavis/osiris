@@ -3,7 +3,7 @@
     "experiment_id": "test_sweep_formal",
     "mode": "synthetic_11d_crsm",
     "node_type": "NODE_BETA_COMPUTE",
-    "timestamp": 1792911643.2381253,
+    "timestamp": 1792914730.4889107,
     "f_max": 0.9787137637477918,
     "tau_0_ns": 46.978713763747805,
     "theta_lock_deg": 51.843,
@@ -59,7 +59,7 @@
     ],
     "f_max_respected": true,
     "coherence_floor_enforced": true,
-    "duration_s": 2.7167000098415883e-05,
-    "entry_hash": "5c823c63ba680a6f2aa109528494181a012b0a9a1c9adfd3c5802e7ad2372d22"
+    "duration_s": 6.0059999668737873e-05,
+    "entry_hash": "fc4e264b36f0c5afb5cf662a550456018876f1bf4508ed4724532ff3bea27c4b"
   }
 ]

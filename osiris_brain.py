@@ -19,6 +19,8 @@ import re
 import shlex
 import subprocess
 import time
+from collections import Counter
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import requests
@@ -478,62 +480,126 @@ def scan_repo(root: str) -> Dict:
 
 
 # ── Repo Security Audit ───────────────────────────────────────────────────────
+def _git_lines(repo: Path, args: List[str]):
+    """Yield stdout lines of ``git <args>`` run in ``repo`` — argv form, never a shell.
+
+    Closing the generator early stops git, the way ``| head`` did, so a large
+    ``git log -p`` is never read fully into memory.
+    """
+    proc = subprocess.Popen(
+        ["git", *args], cwd=str(repo), shell=False,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace",
+    )
+    try:
+        for line in proc.stdout:
+            yield line.rstrip("\n")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close()
+        proc.wait()
+
+
+def _git_text(repo: Path, args: List[str], limit: Optional[int] = None) -> str:
+    with closing(_git_lines(repo, args)) as lines:
+        out = []
+        for line in lines:
+            out.append(line)
+            if limit is not None and len(out) >= limit:
+                break
+    return "\n".join(out)
+
+
+def _git_grep(repo: Path, args: List[str], pattern: str, limit: int) -> str:
+    rx = re.compile(pattern)
+    with closing(_git_lines(repo, args)) as lines:
+        hits = []
+        for line in lines:
+            if rx.search(line):
+                hits.append(line)
+                if len(hits) >= limit:
+                    break
+    return "\n".join(hits)
+
+
+_STAT_LINE = re.compile(r"^\s*(?P<path>.+?)\s+\|\s+(?:(?P<lines>\d+)|Bin \d+ -> (?P<bytes>\d+) bytes)")
+
+
+def _largest_added_files(repo: Path, limit: int = 20) -> str:
+    """Files added anywhere in history, largest first: binaries by bytes, then text by lines."""
+    binaries, texts = [], []
+    with closing(_git_lines(repo, ["log", "--all", "--diff-filter=A", "--stat=200", "--format="])) as lines:
+        for line in lines:
+            m = _STAT_LINE.match(line)
+            if not m:
+                continue
+            if m.group("bytes") is not None:
+                binaries.append((int(m.group("bytes")), m.group("path")))
+            else:
+                texts.append((int(m.group("lines")), m.group("path")))
+    rows = [f"{n:>12,} bytes  {path}" for n, path in sorted(binaries, reverse=True)]
+    rows += [f"{n:>12,} lines  {path}" for n, path in sorted(texts, reverse=True)]
+    return "\n".join(rows[:limit])
+
+
 def audit_repo(path: str) -> str:
-    """Check a local git repo for signs of compromise."""
+    """Check a local git repo for signs of compromise. No subprocess here uses a shell."""
     p = Path(path).expanduser().resolve()
     if not p.exists():
         return f"ERROR: {path} does not exist"
+    try:
+        subprocess.run(["git", "--version"], shell=False, capture_output=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return "ERROR: git is not available"
 
     results = []
     results.append(f"=== Security Audit: {p} ===\n")
 
     # 1. Unknown contributors
-    r = subprocess.run("git log --format='%ae %an' | sort | uniq -c | sort -rn | head -30",
-                       shell=True, capture_output=True, text=True, cwd=str(p))
+    with closing(_git_lines(p, ["log", "--format=%ae %an"])) as lines:
+        counts = Counter(lines)
     results.append("--- Contributors (commit count) ---")
-    results.append(r.stdout or "(none)")
+    results.append("\n".join(f"{n:>7} {who}" for who, n in counts.most_common(30)) or "(none)")
 
     # 2. Recent commits
-    r = subprocess.run("git log --oneline -30 --format='%h %ai %ae %s'",
-                       shell=True, capture_output=True, text=True, cwd=str(p))
     results.append("\n--- Recent 30 commits ---")
-    results.append(r.stdout or "(none)")
+    results.append(_git_text(p, ["log", "-30", "--format=%h %ai %ae %s"]) or "(none)")
 
-    # 3. Changes to CI/CD and workflows
-    r = subprocess.run("git log --oneline --all -- .github/ requirements*.txt pyproject.toml setup.py Dockerfile* Makefile",
-                       shell=True, capture_output=True, text=True, cwd=str(p))
+    # 3. Changes to CI/CD and workflows (globs are git pathspecs, so deleted files count too)
     results.append("\n--- CI/CD / dependency file changes ---")
-    results.append(r.stdout or "(none)")
+    results.append(_git_text(p, [
+        "log", "--oneline", "--all", "--",
+        ".github/", "requirements*.txt", "pyproject.toml", "setup.py", "Dockerfile*", "Makefile",
+    ]) or "(none)")
 
-    # 4. Large binary files added
-    r = subprocess.run(
-        "git log --all --diff-filter=A --stat --format='' | grep -v '^$' | awk '{print $NF,$1}' | sort -rn | head -20",
-        shell=True, capture_output=True, text=True, cwd=str(p))
+    # 4. Large files added
     results.append("\n--- Largest files added to history ---")
-    results.append(r.stdout or "(none)")
+    results.append(_largest_added_files(p) or "(none)")
 
     # 5. Suspicious patterns in recent diffs
-    r = subprocess.run(
-        "git log --since='6 months ago' -p --diff-filter=A -- '*.py' '*.sh' '*.js' 2>/dev/null | "
-        "grep -E '(eval|exec|base64|reverse_shell|nc -e|subprocess.*shell=True.*input|__import__|os\\.system)' | head -30",
-        shell=True, capture_output=True, text=True, cwd=str(p))
     results.append("\n--- Suspicious code patterns in recent additions ---")
-    results.append(r.stdout or "(none — good sign)")
+    results.append(_git_grep(
+        p,
+        ["log", "--since=6 months ago", "-p", "--diff-filter=A", "--", "*.py", "*.sh", "*.js"],
+        r"(eval|exec|base64|reverse_shell|nc -e|subprocess.*shell=True.*input|__import__|os\.system)",
+        limit=30,
+    ) or "(none — good sign)")
 
     # 6. Added SSH keys or tokens
-    r = subprocess.run(
-        "git log --since='6 months ago' -p 2>/dev/null | "
-        "grep -E '(ssh-rsa|BEGIN RSA|BEGIN EC|AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{36})' | head -20",
-        shell=True, capture_output=True, text=True, cwd=str(p))
     results.append("\n--- Credential patterns in history ---")
-    results.append(r.stdout or "(none — good sign)")
+    results.append(_git_grep(
+        p,
+        ["log", "--since=6 months ago", "-p"],
+        r"(ssh-rsa|BEGIN RSA|BEGIN EC|AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{36})",
+        limit=20,
+    ) or "(none — good sign)")
 
     # 7. .git/hooks
     hooks_dir = p / ".git" / "hooks"
     if hooks_dir.exists():
         hooks = [h for h in hooks_dir.iterdir() if not h.name.endswith(".sample")]
         if hooks:
-            results.append(f"\n--- ACTIVE git hooks (REVIEW THESE) ---")
+            results.append("\n--- ACTIVE git hooks (REVIEW THESE) ---")
             for h in hooks:
                 results.append(f"  {h.name}:")
                 try:
