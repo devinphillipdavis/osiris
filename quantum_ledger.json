@@ -1,0 +1,65 @@
+[
+  {
+    "experiment_id": "test_sweep_formal",
+    "mode": "synthetic_11d_crsm",
+    "node_type": "NODE_BETA_COMPUTE",
+    "timestamp": 1792910209.3645022,
+    "f_max": 0.9787137637477918,
+    "tau_0_ns": 46.978713763747805,
+    "theta_lock_deg": 51.843,
+    "results": [
+      {
+        "tau_ns": 0.0,
+        "fidelity": 0.9787137637477918,
+        "projected_gamma": 0.021286236252208157,
+        "effective_gamma": 0.021286236252208157
+      },
+      {
+        "tau_ns": 11.74,
+        "fidelity": 0.6922716216149628,
+        "projected_gamma": 0.3077283783850372,
+        "effective_gamma": 0.092
+      },
+      {
+        "tau_ns": 23.49,
+        "fidelity": 4.209157693855815e-05,
+        "projected_gamma": 0.9999579084230614,
+        "effective_gamma": 0.092
+      },
+      {
+        "tau_ns": 35.23,
+        "fidelity": 0.691868360929051,
+        "projected_gamma": 0.308131639070949,
+        "effective_gamma": 0.092
+      },
+      {
+        "tau_ns": 46.98,
+        "fidelity": 0.978713760127324,
+        "projected_gamma": 0.02128623987267597,
+        "effective_gamma": 0.02128623987267597
+      },
+      {
+        "tau_ns": 58.72,
+        "fidelity": 0.6922121112015522,
+        "projected_gamma": 0.30778788879844776,
+        "effective_gamma": 0.092
+      },
+      {
+        "tau_ns": 70.47,
+        "fidelity": 0.00012627473050513254,
+        "projected_gamma": 0.9998737252694949,
+        "effective_gamma": 0.092
+      },
+      {
+        "tau_ns": 93.96,
+        "fidelity": 0.9787137492659206,
+        "projected_gamma": 0.021286250734079415,
+        "effective_gamma": 0.021286250734079415
+      }
+    ],
+    "f_max_respected": true,
+    "coherence_floor_enforced": true,
+    "duration_s": 0.00011535700014064787,
+    "entry_hash": "c54dc0aadfa07a51673d994cc3973842a7648dd80a39b09e1f4f7ebba5453030"
+  }
+]

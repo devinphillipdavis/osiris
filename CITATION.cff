@@ -1,0 +1,63 @@
+cff-version: 1.2.0
+message: "If you use this software or research, please cite it as below."
+authors:
+  - family-names: "davis"
+    given-names: "devin phillip"
+    affiliation: "agile defense systems llc"
+  - name: "OSIRIS dna::}{::lang NCLM"
+    affiliation: "autonomous quantum discovery system"
+title: "OSIRIS: Autonomous Quantum Discovery System"
+version: 4.0.0
+doi: 10.5281/zenodo.19505774
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.19505773
+    description: "Concept DOI — resolves to the latest OSIRIS-CLI release on Zenodo"
+  - type: doi
+    value: 10.5281/zenodo.19505774
+    description: "OSIRIS-CLI v5.0.0 release tarball (2026-04-11)"
+  - type: doi
+    value: 10.5281/zenodo.18781261
+    description: "Hardware-validated experiments (10 IBM Quantum experiments, Feb 2026)"
+  - type: doi
+    value: 10.5281/zenodo.22855102
+    description: "Controlled hardware tests on ibm_fez, Sept 2026 (tetrahedral-correction null result; staggered DD)"
+  - type: doi
+    value: 10.5281/zenodo.17918774
+    description: "K8 causality discriminator pre-registration (SHA-256 12df8918…)"
+date-released: 2026-04-10
+url: "https://github.com/osiris-dnalang/osiris-cli"
+repository-code: "https://github.com/osiris-dnalang/osiris-cli"
+license: LicenseRef-OSIRIS-Dual-v1.0
+type: software
+keywords:
+  - quantum computing
+  - phase conjugation
+  - qByte mining
+  - tetrahedral quaternion lattice
+  - consciousness
+  - autopoiesis
+  - CRSM manifold
+  - sovereign compute
+  - dna::}{::lang
+  - negentropic efficiency
+  - Scimitar-SSE
+  - cross-device synchronization
+  - bifurcated polarization
+  - AURA AIDEN duality
+  - nclm
+  - neurips
+  - ultra-coder
+  - self-improving
+  - autonomous discovery
+  - iterative refinement
+abstract: >-
+  OSIRIS: Sovereign quantum computing framework with 8-qubit DNA-encoded
+  registers (qByte system), genetically evolved Living Language Model (LivLM),
+  Non-Causal Living Model (NCLM) for quantum text generation, 9-agent NCLLM
+  deliberation swarm, Bayesian cognitive mesh governance, tridirectional
+  introspection engine, adversarial bridge validator, CRSM 7D torsion physics,
+  FABRIC NSF testbed integration, Quantum-to-Matter 3D manufacturing pipeline,
+  and automated Zenodo publishing. 25+ CLI commands, zero external LLM
+  dependencies, pure NumPy quantum execution. Co-authored by devin phillip
+  davis and OSIRIS dna::}{::lang NCLM.
